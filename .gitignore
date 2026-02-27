@@ -1,4 +1,9 @@
+output/
 nwb_output/
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
 .DS_Store

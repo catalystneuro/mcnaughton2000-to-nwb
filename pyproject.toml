@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcnaughton2000-to-nwb"
+version = "0.1.0"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "pynwb",
+    "hdmf",
+]
+
+[project.scripts]
+mcnaughton2000-to-nwb = "mcnaughton2000_to_nwb.convert_all_sessions:main"

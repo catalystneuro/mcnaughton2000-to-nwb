@@ -116,7 +116,7 @@ def convert_session(
         group = nwbfile.create_electrode_group(
             name=tt_name,
             description=f"Tetrode {tt_name}",
-            location="hippocampal area CA1",
+            location="CA1 field of hippocampus",
             device=device,
         )
         electrode_groups[tt_name] = group
@@ -125,7 +125,7 @@ def convert_session(
         for ch in range(4):
             nwbfile.add_electrode(
                 group=group,
-                location="hippocampal area CA1",
+                location="CA1 field of hippocampus",
             )
 
     # --- Parse all CEL files ---
