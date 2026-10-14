@@ -9,6 +9,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+# The tracker writes (0, 255) when it loses the animal.
+LOST_POSITION = (0.0, 255.0)
+
 
 @dataclass
 class CelFile:
@@ -21,14 +24,12 @@ class CelFile:
 
     # Derived
     cluster: int | None = field(init=False)
-    session_type: str = field(init=False)
     start_time_sec: float = field(init=False)
     end_time_sec: float = field(init=False)
     has_position: bool = field(init=False)
 
     def __post_init__(self):
         self.cluster = self._parse_cluster()
-        self.session_type = self._infer_session_type()
         self.start_time_sec = self._parse_time_str(self.header.get("Start time", ""))
         self.end_time_sec = self._parse_time_str(self.header.get("End time", ""))
         self.has_position = "pos_x" in self.fields and "pos_y" in self.fields
@@ -39,16 +40,17 @@ class CelFile:
         return pd.to_numeric(self.data["time"], errors="coerce").to_numpy(dtype=np.float64)
 
     @property
-    def pos_x(self) -> np.ndarray | None:
+    def position(self) -> np.ndarray | None:
+        """Position (pos_x, pos_y) in pixels at each spike, NaN where the tracker lost the animal."""
         if not self.has_position:
             return None
-        return pd.to_numeric(self.data["pos_x"], errors="coerce").to_numpy(dtype=np.float64)
-
-    @property
-    def pos_y(self) -> np.ndarray | None:
-        if not self.has_position:
-            return None
-        return pd.to_numeric(self.data["pos_y"], errors="coerce").to_numpy(dtype=np.float64)
+        xy = np.column_stack([
+            pd.to_numeric(self.data["pos_x"], errors="coerce").to_numpy(dtype=np.float64),
+            pd.to_numeric(self.data["pos_y"], errors="coerce").to_numpy(dtype=np.float64),
+        ])
+        lost = (xy[:, 0] == LOST_POSITION[0]) & (xy[:, 1] == LOST_POSITION[1])
+        xy[lost] = np.nan
+        return xy
 
     def _parse_cluster(self) -> int | None:
         raw = self.header.get("Cluster", "")
@@ -56,16 +58,6 @@ class CelFile:
             return None
         m = re.search(r"(\d+)", raw)
         return int(m.group(1)) if m else None
-
-    def _infer_session_type(self) -> str:
-        name = self.path.stem.upper()
-        if name.startswith("BL"):
-            return "BL"
-        if name.startswith("ES"):
-            return "ES"
-        if name.startswith("MC"):
-            return "MC"
-        return "unknown"
 
     @staticmethod
     def _parse_time_str(time_str: str) -> float:
