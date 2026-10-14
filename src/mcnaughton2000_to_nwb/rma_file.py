@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,22 +12,17 @@ RMA_FILE_SIZE = 32768
 MAP_SHAPE = (64, 64)
 N_PIXELS = MAP_SHAPE[0] * MAP_SHAPE[1]  # 4096
 
+# The original analysis writes this value in bins the animal never visited.
+UNVISITED = -999.0
+
 
 @dataclass
 class RmaFile:
     """Parsed contents of a single .RMA file."""
 
     path: Path
-    rate_map: np.ndarray  # (64, 64) float32, firing rate in Hz
-    occupancy_map: np.ndarray  # (64, 64) int32, bin visit counts
-
-    # Derived from filename
-    session_type: str
-    cell_number: int | None  # None if not a CELL~N file
-
-    @property
-    def is_cell_map(self) -> bool:
-        return self.cell_number is not None
+    rate_map: np.ndarray  # (64, 64) float32, NaN in unvisited bins
+    occupancy_map: np.ndarray  # (64, 64) int32, 60 Hz video samples per bin
 
 
 def read_rma_file(path: Path) -> RmaFile:
@@ -45,45 +39,13 @@ def read_rma_file(path: Path) -> RmaFile:
     rate_map = (
         np.frombuffer(data, dtype=">f4", count=N_PIXELS, offset=0)
         .reshape(MAP_SHAPE)
-        .astype(np.float32, copy=False)
+        .astype(np.float32)
     )
+    rate_map[rate_map == UNVISITED] = np.nan
     occupancy_map = (
         np.frombuffer(data, dtype=">i4", count=N_PIXELS, offset=N_PIXELS * 4)
         .reshape(MAP_SHAPE)
-        .astype(np.int32, copy=False)
+        .astype(np.int32)
     )
 
-    session_type, cell_number = _parse_rma_filename(path.name)
-
-    return RmaFile(
-        path=path,
-        rate_map=rate_map,
-        occupancy_map=occupancy_map,
-        session_type=session_type,
-        cell_number=cell_number,
-    )
-
-
-def _parse_rma_filename(name: str) -> tuple[str, int | None]:
-    """Extract session type and cell number from RMA filename.
-
-    Examples:
-        ESCELL~1.RMA → ("ES", 1)
-        MCCELL~3.RMA → ("MC", 3)
-        ES2BC0~1.RMA → ("ES", None)   # not a per-cell map
-    """
-    upper = name.upper()
-
-    cell_match = re.search(r"CELL~(\d+)", upper)
-    cell_number = int(cell_match.group(1)) if cell_match else None
-
-    if upper.startswith("ES"):
-        session_type = "ES"
-    elif upper.startswith("MC"):
-        session_type = "MC"
-    elif upper.startswith("BL"):
-        session_type = "BL"
-    else:
-        session_type = "unknown"
-
-    return session_type, cell_number
+    return RmaFile(path=path, rate_map=rate_map, occupancy_map=occupancy_map)

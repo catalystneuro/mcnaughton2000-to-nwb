@@ -4,8 +4,9 @@ The Neurolab STS-90 mission flew April 17 – May 3, 1998. Three rats with
 hippocampal tetrode implants were recorded preflight (ground) and in-flight
 on Flight Day 4 (April 20) and Flight Day 9 (April 25).
 
-Rat 1 and Rat 2 were recorded simultaneously on the same acquisition system
-(different tetrode banks). Rat 3 was recorded in a separate session.
+Rat 1 and Rat 2 were recorded in the same acquisition session on each flight
+day (different tetrode banks) and took turns on the task apparatus. Rat 3 was
+recorded in a separate session.
 
 Reference: Knierim, McNaughton & Poe (2000) Nature Neuroscience 3(3):209-212
 DOI: 10.1038/72910
@@ -28,8 +29,12 @@ EXPERIMENT_DESCRIPTION = (
     "to traverse a three-dimensional track ('Escher staircase') and a flat "
     "two-dimensional track ('Magic Carpet') for medial forebrain bundle "
     "stimulation reward. Recordings were made preflight on the ground and "
-    "in-flight on Flight Day 4 and Flight Day 9. Baseline sessions on a "
-    "rectangular track were interleaved with task sessions."
+    "in-flight on Flight Day 4 and Flight Day 9. In baseline (BL) epochs the "
+    "rat rested quietly in the Rodent Sleeping Pouch. Rat 1 and Rat 2 were "
+    "recorded in the same acquisition session on each flight day and took "
+    "turns: while one rat ran the Escher staircase or Magic Carpet, the other "
+    "was in a baseline epoch. The source files hold sorted spikes and the "
+    "original rate maps; no EEG or other continuous voltage was archived."
 )
 
 INSTITUTION = "University of Arizona"
@@ -40,7 +45,7 @@ STRAIN = "Fischer 344"
 SEX = "M"
 
 SESSION_TYPES = {
-    "BL": "Baseline — rectangular track",
+    "BL": "Baseline — the rat rested quietly in the Rodent Sleeping Pouch",
     "ES": "Escher Staircase — three-dimensional track with 90° yaw and pitch turns",
     "MC": "Magic Carpet — flat two-dimensional track",
 }
@@ -63,12 +68,12 @@ SUBJECT_SESSION_MAP: dict[str, dict] = {
     "FD4RAT1": dict(
         rat_id="Rat1",
         session_date=datetime(1998, 4, 20, 9, 57, tzinfo=timezone.utc),
-        session_description="Flight Day 4 recording — Rat 1. Escher Staircase and Magic Carpet tasks with baseline sessions.",
+        session_description="Flight Day 4 recording — Rat 1. Recorded in the same acquisition session as Rat 2; the two rats took turns on the task apparatus.",
     ),
     "FD4RAT2": dict(
         rat_id="Rat2",
         session_date=datetime(1998, 4, 20, 9, 57, tzinfo=timezone.utc),
-        session_description="Flight Day 4 recording — Rat 2. Recorded simultaneously with Rat 1 on shared acquisition system.",
+        session_description="Flight Day 4 recording — Rat 2. Recorded in the same acquisition session as Rat 1; the two rats took turns on the task apparatus.",
     ),
     "FD4RAT3": dict(
         rat_id="Rat3",
@@ -78,12 +83,12 @@ SUBJECT_SESSION_MAP: dict[str, dict] = {
     "FD9RAT1": dict(
         rat_id="Rat1",
         session_date=datetime(1998, 4, 25, 12, 45, tzinfo=timezone.utc),
-        session_description="Flight Day 9 recording — Rat 1. Escher Staircase and Magic Carpet tasks with baseline sessions.",
+        session_description="Flight Day 9 recording — Rat 1. Recorded in the same acquisition session as Rat 2; the two rats took turns on the task apparatus.",
     ),
     "FD9RAT2": dict(
         rat_id="Rat2",
         session_date=datetime(1998, 4, 25, 12, 45, tzinfo=timezone.utc),
-        session_description="Flight Day 9 recording — Rat 2. Recorded simultaneously with Rat 1 on shared acquisition system.",
+        session_description="Flight Day 9 recording — Rat 2. Recorded in the same acquisition session as Rat 1; the two rats took turns on the task apparatus.",
     ),
     "PREFLI~1": dict(
         rat_id="Rat1",
@@ -100,6 +105,16 @@ SUBJECT_SESSION_MAP: dict[str, dict] = {
         session_date=datetime(1998, 4, 14, 13, 49, tzinfo=timezone.utc),
         session_description="Preflight ground recording — Rat 3. Recorded 3 days before launch at Kennedy Space Center.",
     ),
+}
+
+
+# Subject folders recorded in the same acquisition session, which share one
+# video tracker (same recording directory in the spike file headers).
+SHARED_RECORDING: dict[str, str] = {
+    "FD4RAT1": "FD4RAT2",
+    "FD4RAT2": "FD4RAT1",
+    "FD9RAT1": "FD9RAT2",
+    "FD9RAT2": "FD9RAT1",
 }
 
 

@@ -5,19 +5,26 @@ with interleaved task epochs (BL=Baseline, ES=Escher Staircase, MC=Magic Carpet)
 The CEL files contain sorted spike data from Xclust with timestamps in seconds
 relative to recording start. Flight sessions also include position (pos_x, pos_y)
 at each spike time.
+
+The archived files carry Windows 8.3 short names; the original names
+(BL2.cell5, ES.cell1.rmap), which give the epoch and the cluster, are recovered
+from each tetrode folder's WS_FTP.LOG (see short_names.py).
 """
 
 from __future__ import annotations
 
+import hashlib
+import math
 import uuid
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-from pynwb import NWBFile, NWBHDF5IO, ProcessingModule
-from pynwb.behavior import Position, SpatialSeries
+from hdmf.common import DynamicTable, DynamicTableRegion, VectorData
+from pynwb import NWBFile, NWBHDF5IO
+from pynwb.behavior import Position
 from pynwb.ecephys import ElectrodeGroup
-from pynwb.epoch import TimeIntervals
 from pynwb.file import Subject
 from pynwb.misc import Units
 
@@ -29,11 +36,59 @@ from .metadata import (
     RELATED_PUBLICATIONS,
     SEX,
     SESSION_TYPES,
+    SHARED_RECORDING,
     SPECIES,
     STRAIN,
     get_session_metadata,
 )
 from .rma_file import read_rma_file
+from .short_names import parse_long_name, read_long_names
+
+TASK_SESSION_TYPES = ("ES", "MC")
+
+
+@dataclass
+class SpikeFile:
+    """One original spike file: one cluster on one tetrode within one epoch."""
+
+    tetrode: str
+    long_name: str
+    epoch_name: str
+    cel: CelFile
+
+    @property
+    def in_window(self) -> np.ndarray:
+        """Rows whose spike falls within the file's epoch window.
+
+        In 48 of the original files the first row is a spike from before the
+        window, which also appears in the cluster's file for the previous epoch.
+        """
+        t = self.cel.spike_times
+        return (t >= self.cel.start_time_sec) & (t <= self.cel.end_time_sec)
+
+
+def _tetrode_dirs(root: Path) -> list[Path]:
+    return sorted(
+        [p for p in root.iterdir() if p.is_dir() and p.name.upper().startswith("TT")],
+        key=lambda p: int(p.name[2:]),
+    )
+
+
+def _read_spike_files(raw_root: Path, stub_test: bool = False) -> list[SpikeFile]:
+    spike_files = []
+    for tt_dir in _tetrode_dirs(raw_root):
+        long_names = read_long_names(tt_dir)
+        cel_paths = sorted(p for p in tt_dir.iterdir() if p.is_file() and p.suffix.upper() == ".CEL")
+        if stub_test:
+            cel_paths = cel_paths[:2]
+        for cel_path in cel_paths:
+            long_name = long_names[cel_path.name]
+            epoch_name, cell = parse_long_name(long_name)
+            cel = read_cel_file(cel_path)
+            if cel.cluster != cell:
+                raise ValueError(f"{cel_path}: cluster {cel.cluster} in header, cell {cell} in name {long_name}")
+            spike_files.append(SpikeFile(tt_dir.name, long_name, epoch_name, cel))
+    return spike_files
 
 
 def convert_session(
@@ -94,16 +149,15 @@ def convert_session(
             species=SPECIES,
             strain=STRAIN,
             sex=SEX,
-            age="/",
-            description=f"Adult male Fischer 344 rat ({meta.rat_id})",
+            description=(
+                f"Adult male Fischer 344 rat ({meta.rat_id}) from Taconic Biosciences, implanted "
+                "28 to 30 days before launch. The age is not recorded in the source files."
+            ),
         ),
     )
 
     # --- Discover tetrodes and create electrode groups ---
-    tt_dirs = sorted(
-        [p for p in raw_root.iterdir() if p.is_dir() and p.name.upper().startswith("TT")],
-        key=lambda p: int(p.name[2:]),
-    )
+    tt_dirs = _tetrode_dirs(raw_root)
 
     device = nwbfile.create_device(
         name="tetrode_array",
@@ -111,6 +165,7 @@ def convert_session(
     )
 
     electrode_groups: dict[str, ElectrodeGroup] = {}
+    electrode_tt_indices: dict[str, list[int]] = {}
     for tt_dir in tt_dirs:
         tt_name = tt_dir.name
         group = nwbfile.create_electrode_group(
@@ -120,6 +175,7 @@ def convert_session(
             device=device,
         )
         electrode_groups[tt_name] = group
+        electrode_tt_indices[tt_name] = list(range(4 * len(electrode_tt_indices), 4 * len(electrode_tt_indices) + 4))
 
         # Add 4 electrodes per tetrode
         for ch in range(4):
@@ -128,84 +184,23 @@ def convert_session(
                 location="CA1 field of hippocampus",
             )
 
-    # --- Parse all CEL files ---
-    all_cel_files: list[tuple[str, CelFile]] = []  # (tetrode_name, cel_file)
-    for tt_dir in tt_dirs:
-        tt_name = tt_dir.name
-        cel_paths = sorted(
-            p for p in tt_dir.iterdir()
-            if p.is_file() and p.suffix.upper() in (".CEL", ".CELL")
-        )
-        if stub_test:
-            cel_paths = cel_paths[:2]
-        for cel_path in cel_paths:
-            try:
-                cel = read_cel_file(cel_path)
-                all_cel_files.append((tt_name, cel))
-            except Exception as e:
-                print(f"  WARNING: Failed to parse {cel_path}: {e}")
+    spike_files = _read_spike_files(raw_root, stub_test=stub_test)
 
-    # --- Build epochs from unique (start_time, end_time, session_type) ---
-    epoch_set: dict[tuple[float, float, str], None] = {}
-    for tt_name, cel in all_cel_files:
-        key = (cel.start_time_sec, cel.end_time_sec, cel.session_type)
-        if not np.isnan(key[0]) and not np.isnan(key[1]):
-            epoch_set[key] = None
-
-    epochs = nwbfile.create_time_intervals(
-        name="epochs",
-        description="Task epochs within the recording session",
-    )
-    epochs.add_column("session_type", "Task type: BL (Baseline), ES (Escher Staircase), or MC (Magic Carpet)")
-    epochs.add_column("session_type_description", "Description of the task type")
-
-    for start, stop, stype in sorted(epoch_set.keys()):
-        epochs.add_interval(
-            start_time=float(start),
-            stop_time=float(stop),
-            session_type=stype,
-            session_type_description=SESSION_TYPES.get(stype, "Unknown task type"),
-        )
-
-    # --- Add units (merge CEL files by tetrode + cluster) ---
-    nwbfile.add_unit_column("tetrode", "Tetrode name (e.g. TT0)")
-    nwbfile.add_unit_column("cluster_id", "Cluster ID from Xclust sorting")
-
-    # Build electrode index: tetrode name → electrode row indices
-    electrode_tt_indices: dict[str, list[int]] = {}
-    idx = 0
-    for tt_dir in tt_dirs:
-        tt_name = tt_dir.name
-        electrode_tt_indices[tt_name] = list(range(idx, idx + 4))
-        idx += 4
-
-    # Group CEL files by (tetrode, cluster_id) to merge the same neuron across epochs
-    unit_spikes: dict[tuple[str, int], list[np.ndarray]] = defaultdict(list)
-    for tt_name, cel in all_cel_files:
-        cluster_id = cel.cluster if cel.cluster is not None else -1
-        spike_times = cel.spike_times
-        mask = ~np.isnan(spike_times)
-        spike_times = spike_times[mask]
-        if len(spike_times) > 0:
-            unit_spikes[(tt_name, cluster_id)].append(spike_times)
-
-    for tt_name, cluster_id in sorted(unit_spikes.keys()):
-        merged = np.sort(np.concatenate(unit_spikes[(tt_name, cluster_id)]))
-        nwbfile.add_unit(
-            spike_times=merged,
-            tetrode=tt_name,
-            cluster_id=cluster_id,
-            electrodes=electrode_tt_indices[tt_name],
-        )
+    epoch_windows = _add_epochs(nwbfile, spike_files)
+    unit_index = _add_units(nwbfile, spike_files, electrode_tt_indices)
 
     # --- Add position data (flight sessions only) ---
-    has_position = any(cel.has_position for _, cel in all_cel_files)
-    if has_position:
-        _add_position_data(nwbfile, all_cel_files)
+    if any(f.cel.has_position for f in spike_files):
+        task_windows = [w for name, w in epoch_windows.items() if name.rstrip("0123456789") in TASK_SESSION_TYPES]
+        partner = SHARED_RECORDING.get(subject_name)
+        position_files = spike_files
+        if partner is not None:
+            position_files = spike_files + _read_spike_files(base_dir / "1_RAW_(original_files)" / partner)
+        _add_position_data(nwbfile, position_files, task_windows, meta.rat_id, partner)
 
     # --- Add rate maps ---
     if analyzed_root.exists():
-        _add_rate_maps(nwbfile, analyzed_root, stub_test=stub_test)
+        _add_rate_maps(nwbfile, analyzed_root, unit_index, stub_test=stub_test)
 
     # --- Write ---
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -216,59 +211,159 @@ def convert_session(
     return out_path
 
 
+def _add_epochs(nwbfile: NWBFile, spike_files: list[SpikeFile]) -> dict[str, tuple[float, float]]:
+    """Add one epoch per original epoch name (BL1, ES, ES2, ...) and return their windows."""
+    windows: dict[str, tuple[float, float]] = {}
+    for f in spike_files:
+        start, stop = f.cel.start_time_sec, f.cel.end_time_sec
+        if f.epoch_name in windows:
+            start = min(start, windows[f.epoch_name][0])
+            stop = max(stop, windows[f.epoch_name][1])
+        windows[f.epoch_name] = (start, stop)
+
+    epochs = nwbfile.create_time_intervals(
+        name="epochs",
+        description=(
+            "Task epochs within the recording session, one per epoch name in the original file names. "
+            "Where the original files cut an epoch with different windows on different tetrodes, the "
+            "epoch spans all of them; each unit's obs_intervals give the windows used for that unit."
+        ),
+    )
+    epochs.add_column("epoch_name", "Epoch name from the original file names (e.g. BL2, ES, ES1)")
+    epochs.add_column("session_type", "Task type: BL (Baseline), ES (Escher Staircase), or MC (Magic Carpet)")
+    epochs.add_column("session_type_description", "Description of the task type")
+
+    for name, (start, stop) in sorted(windows.items(), key=lambda item: item[1]):
+        session_type = name.rstrip("0123456789")
+        epochs.add_interval(
+            start_time=float(start),
+            stop_time=float(stop),
+            epoch_name=name,
+            session_type=session_type,
+            session_type_description=SESSION_TYPES[session_type],
+        )
+    return windows
+
+
+def _time_resolution(spike_times: np.ndarray) -> float:
+    """Resolution of times written with six significant digits, as in the CEL files."""
+    t_max = float(np.max(spike_times))
+    return 10.0 ** (math.floor(math.log10(t_max)) - 5)
+
+
+def _add_units(
+    nwbfile: NWBFile,
+    spike_files: list[SpikeFile],
+    electrode_tt_indices: dict[str, list[int]],
+) -> dict[tuple[str, int], int]:
+    """Add one unit per (tetrode, cluster) and return the row index of each."""
+    by_unit: dict[tuple[str, int], list[SpikeFile]] = defaultdict(list)
+    for f in spike_files:
+        by_unit[(f.tetrode, f.cel.cluster)].append(f)
+
+    resolution = _time_resolution(np.concatenate([f.cel.spike_times[f.in_window] for f in spike_files]))
+
+    nwbfile.units = Units(
+        name="units",
+        description=(
+            "Sorted units. Each tetrode was cluster-cut once in Xclust over the whole recording (one "
+            "TTn.pos.parms source file per tetrode), and the original spike files hold the spikes of one "
+            "cluster within one epoch. A unit merges the files of one cluster on one tetrode, so it is the "
+            "same sorted cluster across epochs. Spike times were written with six significant digits, so "
+            "they are resolved to 1 ms below 1000 s, 10 ms from 1000 to 9999 s, and 0.1 s from 10000 s; "
+            "spikes in one unit can share a time. In 48 original files the first row is a spike from before "
+            "the file's epoch window; spikes outside a file's window are left out."
+        ),
+        electrode_table=nwbfile.electrodes,
+        resolution=resolution,
+    )
+    nwbfile.add_unit_column("tetrode", "Tetrode name (e.g. TT0)")
+    nwbfile.add_unit_column("cluster_id", "Cluster ID from Xclust sorting")
+    nwbfile.add_unit_column(
+        "source_files",
+        "Original spike files merged into this unit, as tetrode/long name (e.g. TT1/BL2.cell5)",
+        index=True,
+    )
+
+    unit_index: dict[tuple[str, int], int] = {}
+    for key in sorted(by_unit, key=lambda k: (int(k[0][2:]), k[1])):
+        files = sorted(by_unit[key], key=lambda f: f.cel.start_time_sec)
+        times = np.sort(np.concatenate([f.cel.spike_times[f.in_window] for f in files]))
+        tetrode, cluster_id = key
+        unit_index[key] = len(unit_index)
+        nwbfile.add_unit(
+            spike_times=times,
+            obs_intervals=[[f.cel.start_time_sec, f.cel.end_time_sec] for f in files],
+            tetrode=tetrode,
+            cluster_id=cluster_id,
+            source_files=[f"{f.tetrode}/{f.long_name}" for f in files],
+            electrodes=electrode_tt_indices[tetrode],
+        )
+    return unit_index
+
+
 def _add_position_data(
     nwbfile: NWBFile,
-    all_cel_files: list[tuple[str, CelFile]],
+    spike_files: list[SpikeFile],
+    task_windows: list[tuple[float, float]],
+    rat_id: str,
+    partner: str | None,
 ) -> None:
-    """Extract position data from CEL files and add as SpatialSeries.
+    """Add the video tracker position within this rat's ES and MC epochs.
 
-    Position (pos_x, pos_y) is recorded at each spike time. We merge across
-    all cells, sort by time, and deduplicate to reconstruct the position trace
-    as sampled by the video tracker.
+    The source holds position only as a column of the spike files, so the
+    trace is sampled at spike times. Samples from all spike files of the
+    recording are merged; for a shared flight recording that includes the
+    other rat's files, which carry the same tracker.
     """
-    time_pos_pairs: list[tuple[float, float, float]] = []
-
-    for _, cel in all_cel_files:
-        if not cel.has_position:
+    times_list, xy_list = [], []
+    for f in spike_files:
+        xy = f.cel.position
+        if xy is None:
             continue
-        times = cel.spike_times
-        x = cel.pos_x
-        y = cel.pos_y
-        if x is None or y is None:
-            continue
+        times_list.append(f.cel.spike_times[f.in_window])
+        xy_list.append(xy[f.in_window])
+    times = np.concatenate(times_list)
+    xy = np.concatenate(xy_list)
 
-        mask = ~(np.isnan(times) | np.isnan(x) | np.isnan(y))
-        for t, px, py in zip(times[mask], x[mask], y[mask]):
-            time_pos_pairs.append((t, px, py))
+    in_task = np.zeros(len(times), dtype=bool)
+    for start, stop in task_windows:
+        in_task |= (times >= start) & (times <= stop)
+    times, xy = times[in_task], xy[in_task]
 
-    if not time_pos_pairs:
-        return
+    times, first = np.unique(times, return_index=True)
+    xy = xy[first]
 
-    # Sort by time and deduplicate
-    time_pos_pairs.sort(key=lambda tup: tup[0])
-    times_arr = np.array([t for t, _, _ in time_pos_pairs])
-    x_arr = np.array([px for _, px, _ in time_pos_pairs])
-    y_arr = np.array([py for _, _, py in time_pos_pairs])
-
-    # Deduplicate: keep first occurrence of each unique time
-    _, unique_idx = np.unique(times_arr, return_index=True)
-    times_arr = times_arr[unique_idx]
-    x_arr = x_arr[unique_idx]
-    y_arr = y_arr[unique_idx]
+    description = (
+        "Position from the video tracker, available in the source only at spike times (the pos_x and "
+        "pos_y columns of the original spike files), restricted to this rat's ES and MC epochs. "
+        "Samples where the tracker lost the animal, written as (0, 255) in the source, are NaN. "
+        "Occupancy cannot be computed from these samples; the rate_maps table holds the original "
+        "analysis's occupancy, counted from the 60 Hz tracker."
+    )
+    if partner is not None:
+        description += (
+            f" This recording was shared with another rat (folder {partner}), and one tracker served both; "
+            "the samples here merge both rats' spike files. In each window one rat ran the task while the "
+            f"other rested in the sleeping pouch, so the trace in {rat_id}'s ES and MC epochs is taken to be "
+            f"{rat_id}'s position, as in the original rate maps. The source files do not name the tracked animal."
+        )
 
     behavior_module = nwbfile.create_processing_module(
         name="behavior",
         description="Behavioral data (position tracking)",
     )
-
     position = Position(name="position")
     position.create_spatial_series(
         name="spatial_series",
-        data=np.column_stack([x_arr, y_arr]),
-        timestamps=times_arr,
-        reference_frame="Video tracker pixel coordinates",
+        data=xy,
+        timestamps=times,
+        reference_frame=(
+            "Pixel coordinates (0 to 255) of the video tracker image, as written in the original spike files. "
+            "The camera view and the pixel size on the apparatus are not recorded in the source files."
+        ),
         unit="pixels",
-        description="Animal position from video tracking, sampled at spike occurrence times",
+        description=description,
     )
     behavior_module.add(position)
 
@@ -276,56 +371,93 @@ def _add_position_data(
 def _add_rate_maps(
     nwbfile: NWBFile,
     analyzed_root: Path,
+    unit_index: dict[tuple[str, int], int],
     stub_test: bool = False,
 ) -> None:
-    """Read .RMA files and store as a DynamicTable with 2D array columns."""
-    from hdmf.common import DynamicTable, VectorData
-
-    tt_dirs = sorted(
-        [p for p in analyzed_root.iterdir() if p.is_dir() and p.name.upper().startswith("TT")],
-        key=lambda p: int(p.name[2:]),
-    )
-
-    # Collect all RMA data
+    """Read .RMA files and store them as a table linked to the units table."""
     rows: list[dict] = []
-    for tt_dir in tt_dirs:
+    for tt_dir in _tetrode_dirs(analyzed_root):
+        long_names = read_long_names(tt_dir)
         rma_paths = sorted(tt_dir.glob("*.RMA"))
         if stub_test:
             rma_paths = rma_paths[:2]
         for rma_path in rma_paths:
-            try:
-                rma = read_rma_file(rma_path)
-                rows.append(dict(
-                    tetrode=tt_dir.name,
-                    source_file=rma_path.name,
-                    session_type=rma.session_type,
-                    cell_number=rma.cell_number if rma.cell_number is not None else -1,
-                    rate_map=rma.rate_map,
-                    occupancy_map=rma.occupancy_map,
-                ))
-            except Exception as e:
-                print(f"  WARNING: Failed to parse {rma_path}: {e}")
+            long_name = long_names[rma_path.name]
+            epoch_name, cluster_id = parse_long_name(long_name)
+            key = (tt_dir.name, cluster_id)
+            if key not in unit_index:
+                print(f"  WARNING: Skipping {tt_dir.name}/{long_name}: no spike file for this cluster")
+                continue
+            rma = read_rma_file(rma_path)
+            rows.append(dict(
+                unit=unit_index[key],
+                tetrode=tt_dir.name,
+                cluster_id=cluster_id,
+                epoch_name=epoch_name,
+                source_file=long_name,
+                archived_file_name=rma_path.name,
+                digest=hashlib.sha256(rma_path.read_bytes()).hexdigest(),
+                rate_map=rma.rate_map,
+                occupancy_map=rma.occupancy_map,
+            ))
+
+    # Some files are byte-identical copies of a map stored under another cell
+    # or tetrode; which cell such a map belongs to cannot be told, so all
+    # copies are left out.
+    digest_count = defaultdict(int)
+    for r in rows:
+        digest_count[r["digest"]] += 1
+    for r in rows:
+        if digest_count[r["digest"]] > 1:
+            print(f"  WARNING: Skipping {r['tetrode']}/{r['source_file']}: identical to another map in this session")
+    rows = [r for r in rows if digest_count[r["digest"]] == 1]
 
     if not rows:
         return
 
-    # Build the DynamicTable
-    n = len(rows)
     rate_map_table = DynamicTable(
         name="rate_maps",
         description=(
-            "Spatial firing rate maps and occupancy maps from legacy analysis. "
-            "Each row corresponds to one .RMA file. Cell-specific maps (cell_number != -1) "
-            "can be matched to the cluster_id in the units table "
-            "for the same tetrode and session_type."
+            "Spatial firing rate maps and occupancy maps from the original analysis, one row per original "
+            ".rmap file, linked to the unit whose cluster the file name gives. Maps are 64 x 64 bins over "
+            "the tracker's 256 x 256 pixel image: bin [i, j] covers pos_y from 4i to 4i + 3 and pos_x from "
+            "4j to 4j + 3. Maps that were byte-identical copies of another map in the same session were "
+            "left out."
         ),
         columns=[
+            DynamicTableRegion(
+                name="unit",
+                description="Unit in the units table (same tetrode and cluster)",
+                data=[r["unit"] for r in rows],
+                table=nwbfile.units,
+            ),
             VectorData(name="tetrode", description="Tetrode name (e.g. TT0)", data=[r["tetrode"] for r in rows]),
-            VectorData(name="source_file", description="Original .RMA filename", data=[r["source_file"] for r in rows]),
-            VectorData(name="session_type", description="Task type (ES/MC/BL)", data=[r["session_type"] for r in rows]),
-            VectorData(name="cell_number", description="Cell number from CELL~N filename; -1 if not a per-cell map", data=[r["cell_number"] for r in rows]),
-            VectorData(name="rate_map", description="64x64 spatial firing rate map (Hz)", data=[r["rate_map"] for r in rows]),
-            VectorData(name="occupancy_map", description="64x64 spatial occupancy map (bin visit counts)", data=[r["occupancy_map"] for r in rows]),
+            VectorData(name="cluster_id", description="Cluster ID from Xclust sorting", data=[r["cluster_id"] for r in rows]),
+            VectorData(name="epoch_name", description="Epoch name from the original file name (e.g. ES, ES2, MC)", data=[r["epoch_name"] for r in rows]),
+            VectorData(name="source_file", description="Original file name (e.g. ES.cell5.rmap)", data=[r["source_file"] for r in rows]),
+            VectorData(
+                name="archived_file_name",
+                description="Windows 8.3 short name under which the file is archived in NASA OSDR OSD-968",
+                data=[r["archived_file_name"] for r in rows],
+            ),
+            VectorData(
+                name="rate_map",
+                description=(
+                    "64x64 spatial firing rate map from the original analysis. The original documentation "
+                    "describes it as spikes in each bin divided by the bin's occupancy; the maps are smoothed "
+                    "and the kernel is not recorded in the source files. Unvisited bins are NaN (-999 in the "
+                    "source)."
+                ),
+                data=[r["rate_map"] for r in rows],
+            ),
+            VectorData(
+                name="occupancy_map",
+                description=(
+                    "64x64 occupancy map: the number of 60 Hz video samples in each bin. Samples where the "
+                    "tracker lost the animal (pixel 0, 255) are counted in bin [63, 0]."
+                ),
+                data=[r["occupancy_map"] for r in rows],
+            ),
         ],
     )
 

@@ -8,9 +8,13 @@ version = "0.1.0"
 requires-python = ">=3.9"
 dependencies = [
     "numpy",
+    "pandas",
     "pynwb",
     "hdmf",
 ]
+
+[project.optional-dependencies]
+test = ["pytest"]
 
 [project.scripts]
 mcnaughton2000-to-nwb = "mcnaughton2000_to_nwb.convert_all_sessions:main"
