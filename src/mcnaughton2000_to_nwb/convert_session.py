@@ -149,6 +149,7 @@ def convert_session(
             species=SPECIES,
             strain=STRAIN,
             sex=SEX,
+            age="/",  # unknown
             description=(
                 f"Adult male Fischer 344 rat ({meta.rat_id}) from Taconic Biosciences, implanted "
                 "28 to 30 days before launch. The age is not recorded in the source files."
